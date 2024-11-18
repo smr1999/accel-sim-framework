@@ -71,7 +71,8 @@ enum wmma_type {
   COL,
   M16N16K16,
   M32N8K16,
-  M8N32K16
-
+  M8N32K16,
+  M8N8K32,
+  M8N8K128
 };
 #endif

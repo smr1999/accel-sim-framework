@@ -172,13 +172,26 @@ breakaddr  TC; yylval->int_value = BREAKADDR_OP; return OPCODE;
 
 <INITIAL,NOT_OPCODE,IN_INST,IN_FUNC_DECL>{
 \.a\.sync\.aligned TC; yylval->int_value = LOAD_A; return WMMA_DIRECTIVE;
+\.a\.sync  TC; yylval->int_value = LOAD_A; return WMMA_DIRECTIVE;
+
 \.b\.sync\.aligned TC; yylval->int_value = LOAD_B; return WMMA_DIRECTIVE;
+\.b\.sync TC; yylval->int_value = LOAD_B; return WMMA_DIRECTIVE;
+
 \.c\.sync\.aligned TC; yylval->int_value = LOAD_C; return WMMA_DIRECTIVE;
+\.c\.sync TC; yylval->int_value = LOAD_C; return WMMA_DIRECTIVE;
+
 \.d\.sync\.aligned TC; yylval->int_value = STORE_D; return WMMA_DIRECTIVE;
+\.d\.sync TC; yylval->int_value = STORE_D; return WMMA_DIRECTIVE;
+
 \.mma\.sync\.aligned TC;yylval->int_value=MMA; return WMMA_DIRECTIVE;
+\.mma\.sync TC;yylval->int_value=MMA; return WMMA_DIRECTIVE;
+
+\.mma\.xor\.popc\.sync\.aligned TC;yylval->int_value=MMA; return WMMA_DIRECTIVE;
+\.mma\.and\.popc\.sync\.aligned TC;yylval->int_value=MMA; return WMMA_DIRECTIVE;
 
 \.row TC; yylval->int_value = ROW; return LAYOUT;
 \.col TC; yylval->int_value = COL; return LAYOUT;
+
 \.m16n16k16\.global TC; yylval->int_value = M16N16K16; return CONFIGURATION;
 \.m32n8k16\.global TC; yylval->int_value = M32N8K16; return CONFIGURATION;
 \.m8n32k16\.global TC;  yylval->int_value = M8N32K16; return CONFIGURATION;
@@ -190,6 +203,14 @@ breakaddr  TC; yylval->int_value = BREAKADDR_OP; return OPCODE;
 \.m16n16k16 TC; yylval->int_value = M16N16K16; return CONFIGURATION;
 \.m32n8k16 TC; yylval->int_value = M32N8K16; return CONFIGURATION;
 \.m8n32k16 TC;  yylval->int_value = M8N32K16; return CONFIGURATION;
+
+\.m8n8k128\.global TC; yylval->int_value = M8N8K128; return CONFIGURATION;
+\.m8n8k128\.shared TC; yylval->int_value = M8N8K128; return CONFIGURATION;
+\.m8n8k128 TC; yylval->int_value = M8N8K128; return CONFIGURATION;
+
+\.m8n8k32\.global TC; yylval->int_value = M8N8K32; return CONFIGURATION;
+\.m8n8k32\.shared TC; yylval->int_value = M8N8K32; return CONFIGURATION;
+\.m8n8k32 TC; yylval->int_value = M8N8K32; return CONFIGURATION;
 
 \.f4e TC;  return PRMT_F4E_MODE;
 \.b4e TC;  return PRMT_B4E_MODE;
@@ -274,6 +295,9 @@ breakaddr  TC; yylval->int_value = BREAKADDR_OP; return OPCODE;
 0[fF][0-9a-fA-F]{8}  TC; sscanf(yytext+2,"%x", (unsigned*)(void*)&yylval->float_value); return FLOAT_OPERAND;
 0[dD][0-9a-fA-F]{16}  TC; sscanf(yytext+2,"%Lx", (unsigned long long*)(void*)&yylval->double_value); return DOUBLE_OPERAND;
 
+\.b1   TC;  return U32_TYPE;
+\.s4   TC;  return U32_TYPE;
+\.u4   TC;  return U32_TYPE;
 \.s8   TC;  return S8_TYPE;
 \.s16  TC;  return S16_TYPE;
 \.s32  TC;  return S32_TYPE;

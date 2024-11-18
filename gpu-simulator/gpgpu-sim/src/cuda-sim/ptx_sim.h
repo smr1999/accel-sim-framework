@@ -331,6 +331,11 @@ class ptx_thread_info {
       const operand_info &dst, const ptx_reg_t &data1, const ptx_reg_t &data2,
       const ptx_reg_t &data3, const ptx_reg_t &data4, const ptx_reg_t &data5,
       const ptx_reg_t &data6, const ptx_reg_t &data7, const ptx_reg_t &data8);
+  
+  void set_wmma_vector_operand_values(
+      const operand_info &dst, const ptx_reg_t &data1, const ptx_reg_t &data2);
+  void set_wmma_vector_operand_values(
+      const operand_info &dst, const ptx_reg_t &data1);
 
   function_info *func_info() { return m_func_info; }
   void print_insn(unsigned pc, FILE *fp) const;

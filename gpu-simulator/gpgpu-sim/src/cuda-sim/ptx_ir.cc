@@ -1253,6 +1253,14 @@ ptx_instruction::ptx_instruction(
       case M32N8K16:
       case M8N32K16:
         break;
+      // For u4, s4
+      case M8N8K32:
+	      m_wmma_config = last_ptx_inst_option;
+	      break;
+      // For b1
+      case M8N8K128:
+ 	      m_wmma_config = last_ptx_inst_option;
+	      break;
       default:
         assert(0);
         break;

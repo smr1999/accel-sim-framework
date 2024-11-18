@@ -1,0 +1,6 @@
+*/*
+
+!*.cu
+!*/config_*_islip.icnt
+!*/gpgpusim.config
+!*/Makefile

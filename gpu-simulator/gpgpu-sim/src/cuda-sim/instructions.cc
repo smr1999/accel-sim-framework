@@ -806,6 +806,35 @@ void ptx_thread_info::set_vector_operand_values(const operand_info &dst,
 
   m_last_set_operand_value = data1;
 }
+
+void ptx_thread_info::set_wmma_vector_operand_values(
+  const operand_info &dst, const ptx_reg_t &data1, const ptx_reg_t &data2){
+
+  unsigned num_elements = dst.get_vect_nelem();
+  if(num_elements == 2){
+	set_reg(dst.vec_symbol(0), data1);
+	set_reg(dst.vec_symbol(1), data2);	
+
+  } else{
+	  printf("error:set_wmma_vector_operands override");
+	}
+  m_last_set_operand_value = data2;
+}
+
+void ptx_thread_info::set_wmma_vector_operand_values(
+  const operand_info &dst, const ptx_reg_t &data1){
+
+  unsigned num_elements = dst.get_vect_nelem();
+ 
+  if(num_elements ==1){
+    set_reg(dst.vec_symbol(0), data1);
+  }
+  else{
+    printf("error:set_wmma_vector_operands override");
+  }
+  m_last_set_operand_value =data1;
+}
+
 void ptx_thread_info::set_wmma_vector_operand_values(
     const operand_info &dst, const ptx_reg_t &data1, const ptx_reg_t &data2,
     const ptx_reg_t &data3, const ptx_reg_t &data4, const ptx_reg_t &data5,
@@ -1906,6 +1935,15 @@ void mma_impl(const ptx_instruction *pI, core_t *core, warp_inst_t inst) {
   ptx_reg_t matrix_b[16][16];
   ptx_reg_t matrix_c[16][16];
   ptx_reg_t matrix_d[16][16];
+
+  // experimental and int
+  ptx_reg_t matrix_a_int4[8][32];
+  ptx_reg_t matrix_b_int4[32][8];
+  ptx_reg_t matrix_a_b1[8][128];
+  ptx_reg_t matrix_b_b1[128][8];
+  ptx_reg_t matrix_c_ex[8][8];
+  ptx_reg_t matrix_d_ex[8][8];
+
   ptx_reg_t src_data;
   ptx_thread_info *thread;
 
@@ -1913,6 +1951,7 @@ void mma_impl(const ptx_instruction *pI, core_t *core, warp_inst_t inst) {
   unsigned b_layout = pI->get_wmma_layout(1);
   unsigned type = pI->get_type();
   unsigned type2 = pI->get_type2();
+  unsigned wmma_config = pI->get_wmma_config();
   int tid;
   const operand_info &dst = pI->operand_lookup(0);
 
@@ -1922,6 +1961,11 @@ void mma_impl(const ptx_instruction *pI, core_t *core, warp_inst_t inst) {
     tid = inst.warp_id() * core->get_warp_size();
   float temp;
   half temp2;
+
+  if(type2==U8_TYPE)
+	  goto SMY2;
+  if(wmma_config==M8N8K32 || wmma_config==M8N8K128)
+	  goto SMY21;
 
   for (thrd = 0; thrd < core->get_warp_size(); thrd++) {
     thread = core->get_thread_info()[tid + thrd];
@@ -2035,30 +2079,33 @@ void mma_impl(const ptx_instruction *pI, core_t *core, warp_inst_t inst) {
   }
   for (i = 0; i < 16; i++) {
     for (j = 0; j < 16; j++) {
-      matrix_d[i][j].f16 = 0;
+      if(type == F16_TYPE)
+        matrix_d[i][j].f16 = 0;
+      else
+        matrix_d[i][j].f32 = 0;
     }
   }
 
   for (i = 0; i < 16; i++) {
     for (j = 0; j < 16; j++) {
       for (k = 0; k < 16; k++) {
-        matrix_d[i][j].f16 =
-            matrix_d[i][j].f16 + matrix_a[i][k].f16 * matrix_b[k][j].f16;
+        if (type == F16_TYPE){
+          matrix_d[i][j].f16 += matrix_a[i][k].f16 * matrix_b[k][j].f16;
+        }
+        else{
+          matrix_d[i][j].f32 += (float)(matrix_a[i][k].f16) * (float)matrix_b[k][j].f16;
+        }
       }
-      if ((type == F16_TYPE) && (type2 == F16_TYPE))
+      if ((type == F16_TYPE) && (type2 == F16_TYPE)){
         matrix_d[i][j].f16 += matrix_c[i][j].f16;
-      else if ((type == F32_TYPE) && (type2 == F16_TYPE)) {
-        temp2 = matrix_d[i][j].f16 + matrix_c[i][j].f16;
-        temp = temp2;
-        matrix_d[i][j].f32 = temp;
+      } else if ((type == F32_TYPE) && (type2 == F16_TYPE)) {
+        matrix_d[i][j].f32 += (float)matrix_c[i][j].f16;
       } else if ((type == F16_TYPE) && (type2 == F32_TYPE)) {
         temp = matrix_d[i][j].f16;
         temp += matrix_c[i][j].f32;
         matrix_d[i][j].f16 = half(temp);
       } else {
-        temp = matrix_d[i][j].f16;
-        temp += matrix_c[i][j].f32;
-        matrix_d[i][j].f32 = temp;
+        matrix_d[i][j].f32 += matrix_c[i][j].f32;
       }
     }
   }
@@ -2133,6 +2180,399 @@ void mma_impl(const ptx_instruction *pI, core_t *core, warp_inst_t inst) {
       printf("wmma:mma:wrong type\n");
       abort();
     }
+  }
+  // Check again
+  if(type2!=U8_TYPE)
+	  return;
+
+SMY2:
+  for (thrd = 0; thrd < core->get_warp_size(); thrd++) {
+    thread = core->get_thread_info()[tid + thrd];
+    if (core->get_gpu()->gpgpu_ctx->debug_tensorcore)
+      printf("THREAD=%d\n:", thrd);
+    for (int operand_num = 1; operand_num <= 3; operand_num++) {
+      const operand_info &src_a = pI->operand_lookup(operand_num);
+      unsigned nelem = src_a.get_vect_nelem();
+      ptx_reg_t v[8];
+      thread->get_vector_operand_values(src_a, v, nelem);
+
+      if (core->get_gpu()->gpgpu_ctx->debug_tensorcore) {
+        printf("Thread%d_Iteration=%d\n:", thrd, operand_num);
+        for (k = 0; k < nelem; k++) {
+		      switch(operand_num){
+		        case 1:
+		        case 2:
+            printf("%u ",(v[k].u64>>24) & 0xff);
+            printf("%u ",(v[k].u64>>16) & 0xff);
+            printf("%u ",(v[k].u64>>8) & 0xff);
+            printf("%u ",(v[k].u64) & 0xff);
+            printf("\n");
+		        break;
+
+		        case 3:
+			      printf("  %d->",v[k].s32);
+			      printf("%llx,  ", v[k].u64);
+			      break;
+		        default:
+			      printf("error\n");
+		      }
+	
+        }
+        printf("\n");
+      }
+
+      ptx_reg_t nw_v[8];
+      uint8_t val;
+
+      if (operand_num != 3) {
+        for (k = 0; k < 4 * nelem; k++) {
+          val = (v[k / 4].s64 >> (24 - (k%4)*8)) & 0xff;
+          nw_v[k].u8 = val;
+        }
+      }
+      switch (operand_num) {
+      case 1:  // operand 1
+      for (k = 0; k < 8; k++) {
+		    if(k/4==0){
+			    row = thrd/4;
+			    col = 4*(thrd%4)+k;
+		    }
+		    else{
+			    row = thrd/4+8;
+			    col = 4*(thrd%4)+(k-4);
+          if (core->get_gpu()->gpgpu_ctx->debug_tensorcore)
+            if(thrd==1)
+              printf("%u %u\n", row, col);
+		    }
+		    matrix_a[row][col] = nw_v[k];
+      }
+      break;
+      case 2:  // operand 2
+      for (k = 0; k < 8; k++) {
+		    if(k/4==0){
+			    row = 4*(thrd%4)+k;
+			    col = thrd/4;
+		    }
+		    else{
+			    row = 4*(thrd%4)+k-4;
+			    col = thrd/4+8;
+		    }
+		    matrix_b[row][col] = nw_v[k];
+      }
+      break;
+      case 3:  // operand 3
+        for (k = 0; k < 8; k++) {
+          if(k/4==0){
+            row = thrd/4;
+            col = 4*(thrd%4)+k;
+          }
+          else{
+            row = thrd/4+8;
+            col = 4*(thrd%4)+k-4;
+          }
+          matrix_c[row][col] = v[k];
+        }
+        break;
+        default:
+        printf("Invalid Operand Index\n");
+      }
+    } 
+  }
+  
+  if (core->get_gpu()->gpgpu_ctx->debug_tensorcore) {
+    printf("\nmatrix_A\n");
+    for (i = 0; i < 16; i++) {
+      for (j = 0; j < 16; j++) {
+        printf("%d ",matrix_a[i][j].u8);
+      }
+      printf("\n");
+    }
+
+    printf("\nmatrix_B\n");
+    for (i = 0; i < 16; i++) {
+      for (j = 0; j < 16; j++) {
+        printf("%d ",matrix_b[i][j].u8);
+      }
+      printf("\n");
+    }
+
+    printf("\nmatrix_C\n");
+    for (i = 0; i < 16; i++) {
+      for (j = 0; j < 16; j++) {
+        printf("%d ",matrix_c[i][j].s32);
+      }
+      printf("\n");
+    } 
+  }
+     
+  for (i = 0; i < 16; i++) {
+    for (j = 0; j < 16; j++) {
+      matrix_d[i][j].s32 = 0;
+    }
+  }
+
+  if (core->get_gpu()->gpgpu_ctx->debug_tensorcore) {
+    printf("\nmatrix_D before computation \n");
+    for (i = 0; i < 16; i++) {
+      for (j = 0; j < 16; j++) {
+        printf("%d ",matrix_d[i][j].s32);
+      }
+      printf("\n");
+    }
+  }
+
+  for (i = 0; i < 16; i++) {
+    for (j = 0; j < 16; j++) {
+      for (k = 0; k < 16; k++) {
+        matrix_d[i][j].s32 += matrix_a[i][k].u8 * matrix_b[k][j].u8;
+	    }
+	    matrix_d[i][j].s32 +=matrix_c[i][j].s32;  
+    }
+  }
+
+if (core->get_gpu()->gpgpu_ctx->debug_tensorcore) {
+  printf("\nmatrix_D after computation \n");
+  for( i = 0  ; i < 16 ; i++){
+    for(j = 0; j <16; j++)
+      printf("%d ",matrix_d[i][j].s32);
+    printf("\n");
+  }
+}
+
+for (thrd = 0; thrd < core->get_warp_size(); thrd++) {
+  int row_t1=thrd/4;
+	int row_t2=thrd/4+8;
+	int col_t=(thrd%4)*4;
+ 	thread = core->get_thread_info()[tid + thrd];
+/*	
+  printf("thread%d\n",thrd);
+	printf("%d\n",matrix_d[row_t1][col_t]);
+	printf("%d\n",row_t1);
+	printf("%d\n",col_t);
+  printf("%d\n",col_t+1);
+	printf("%d\n",col_t+2);
+	printf("%d\n",col_t+3);
+
+	printf("%d\n",row_t2);
+  printf("%d\n",col_t);
+  printf("%d\n",col_t+1);
+  printf("%d\n",col_t+2);
+  printf("%d\n",col_t+3);
+*/
+
+/*
+	printf("thread%d  %d : row %d col %d\n",thrd, matrix_d[row_t1][col_t], row_t1, col_t );
+	printf("thread%d  %d : row %d col %d\n ", thrd, matrix_d[row_t1][col_t+1], row_t1, col_t+1);
+  printf("thread%d  %d : row %d col %d\n ", thrd, matrix_d[row_t1][col_t+2], row_t1, col_t+2);
+	printf("thread%d  %d : row %d col %d\n ", thrd, matrix_d[row_t1][col_t+3], row_t1, col_t+3);
+	printf("thread%d  %d : row %d col %d\n ", thrd, matrix_d[row_t2][col_t], row_t2, col_t);
+	printf("thread%d  %d : row %d col %d\n ", thrd, matrix_d[row_t2][col_t+1], row_t2, col_t+1);
+	printf("thread%d  %d : row %d col %d\n ", thrd, matrix_d[row_t2][col_t+2], row_t2, col_t+2);
+	printf("thread%d  %d : row %d col %d\n\n ", thrd,  matrix_d[row_t2][col_t+3], row_t2, col_t+3);
+
+*/
+	thread->set_wmma_vector_operand_values(
+	dst, matrix_d[row_t1][col_t], matrix_d[row_t1][col_t+1],
+	matrix_d[row_t1][col_t+2], matrix_d[row_t1][col_t+3],
+	matrix_d[row_t2][col_t], matrix_d[row_t2][col_t+1],
+	matrix_d[row_t2][col_t+2], matrix_d[row_t2][col_t+3]);	
+      
+	//dst.vec_symbol(0)->name();
+  /*	
+  printf("thrd %d   total thread %d\n", thrd, core->get_warp_size());
+	printf("%s\n",(dst.vec_symbol(0)->name().c_str()));
+	printf("%s\n",(dst.vec_symbol(1)->name().c_str()));
+	printf("%s\n",(dst.vec_symbol(2)->name().c_str()));
+	printf("%s\n",(dst.vec_symbol(3)->name().c_str()));
+	printf("%s\n",(dst.vec_symbol(4)->name().c_str()));
+	printf("%s\n",(dst.vec_symbol(5)->name().c_str()));
+	printf("%s\n",(dst.vec_symbol(6)->name().c_str()));
+	printf("%s\n",(dst.vec_symbol(7)->name().c_str()));
+ */
+}
+return;
+
+SMY21:
+  for (thrd = 0; thrd < core->get_warp_size(); thrd++) {
+    thread = core->get_thread_info()[tid + thrd];
+    if (core->get_gpu()->gpgpu_ctx->debug_tensorcore)
+      printf("THREAD=%d\n:", thrd);
+    for (int operand_num = 1; operand_num <= 3; operand_num++) {
+      const operand_info &src_a = pI->operand_lookup(operand_num);
+      unsigned nelem = src_a.get_vect_nelem();
+	    ptx_reg_t v[2];
+      thread->get_vector_operand_values(src_a, v, nelem);
+
+      if (core->get_gpu()->gpgpu_ctx->debug_tensorcore) {
+        printf("Thread%d_Iteration=%d\n:", thrd, operand_num);
+        for (k = 0; k < nelem; k++) {
+          switch(operand_num){
+            case 1:
+            case 2:
+  			    printf("%d \n", v[k].s32);
+            break;
+
+            case 3:
+            printf("%d ",v[k].s32); 
+            break;
+
+            default:
+            printf("error\n");
+          }
+        }
+        printf("\n");
+      }
+      ptx_reg_t nw_v[32];
+      int val;
+    
+    
+      if(wmma_config==M8N8K32)
+        if (operand_num != 3) {
+          for (k = 0; k < 8; k++) {
+            val = (v[0].s32 >> (28 - 4*k)) & 0xf;
+            nw_v[k] = val;
+            if (core->get_gpu()->gpgpu_ctx->debug_tensorcore) 
+              printf("%d ",val);
+          }
+        }
+      if(wmma_config==M8N8K128)
+        if (operand_num != 3) {
+          for (k = 0; k < 32; k++) {
+            val = (v[0].s32 >> (31-k)) & 1;
+            nw_v[k] = val;
+            if (core->get_gpu()->gpgpu_ctx->debug_tensorcore) 
+              printf("%d ",val);
+          }
+        }
+
+        switch (operand_num) {
+        case 1:  // operand 1
+          if(wmma_config==M8N8K32)
+		        for (k = 0; k < 8; k++) {
+              row = thrd/4;
+			        col = 8*(thrd%4)+k;
+              matrix_a_int4[row][col] = nw_v[k];
+            }
+	
+	        else
+		        for (k = 0; k < 32; k++) {
+              row = thrd/4;
+              col = 32*(thrd%4)+k;
+              matrix_a_b1[row][col] = nw_v[k];
+            }
+          break;
+          case 2:  // operand 2
+	          if(wmma_config==M8N8K32)
+           	  for (k = 0; k < 8; k++) {
+                row = 8*(thrd%4)+k;
+                col = thrd/4;
+                matrix_b_int4[row][col] = nw_v[k];
+          	  }
+		
+	          else
+		          for (k = 0; k < 32; k++) {
+                row = 32*(thrd%4)+k;
+                col = thrd/4;
+                matrix_b_b1[row][col] = nw_v[k];
+              }
+          break;
+
+          case 3:  // operand 3
+            for (k = 0; k < 2; k++) {
+              row = thrd/4;
+              col = 2*(thrd%4)+k;
+              matrix_c_ex[row][col] = v[k];
+            }
+            break;
+          default:
+            printf("Invalid Operand Index\n");
+	      }
+    }
+  }
+
+  for (i = 0; i < 8; i++) {
+    for (j = 0; j < 8; j++) {
+      matrix_d_ex[i][j].s32 = 0;
+    }
+  }
+
+if(wmma_config==M8N8K32)
+ for (i = 0; i < 8; i++) {
+    for (j = 0; j < 8; j++) {
+      for (k = 0; k < 32; k++) {
+        matrix_d_ex[i][j].s32 += matrix_a_int4[i][k].u8 * matrix_b_int4[k][j].u8;
+      }
+      matrix_d_ex[i][j].s32 +=matrix_c_ex[i][j].s32;
+    }
+ }
+
+else
+  for (i = 0; i < 8; i++) {
+    for (j = 0; j < 8; j++) {
+      for (k = 0; k < 128; k++) {
+        matrix_d_ex[i][j].s32 += matrix_a_b1[i][k].u8 ^ matrix_b_b1[k][j].u8;
+      }
+      matrix_d_ex[i][j].s32 +=matrix_c_ex[i][j].s32;
+    }
+  }
+
+  if (core->get_gpu()->gpgpu_ctx->debug_tensorcore){
+   	printf("\nmatrix_A\n");
+	  if(wmma_config==M8N8K32)
+  		for (i = 0; i < 8; i++) {
+    		for (j = 0; j < 32; j++) {
+      		printf("%d ",matrix_a_int4[i][j].u8);
+    		}
+        printf("\n");
+  		}
+	  else
+  		for (i = 0; i < 8; i++) {
+    		for (j = 0; j < 128; j++) {
+      		printf("%d ",matrix_a_b1[i][j].u8);
+    		}
+        printf("\n");
+  		}
+    
+	  printf("\nmatrix_B\n");
+	  if(wmma_config==M8N8K32)
+  		for (i = 0; i < 32; i++) {
+    	  for (j = 0; j < 8; j++) {
+      		printf("%d ",matrix_b_int4[i][j].u8);
+    		}
+        printf("\n");
+  		}
+	  else
+  		for (i = 0; i < 128; i++) {
+    		for (j = 0; j < 8; j++) {
+    			printf("%d ",matrix_b_b1[i][j].u8);
+    		}
+        printf("\n");
+  		}
+
+ 	  printf("\nmatrix_C\n");
+  	  for (i = 0; i < 8; i++) {
+    	  for (j = 0; j < 8; j++) {
+      		printf("%d ",matrix_c_ex[i][j].s32);
+    		}
+        printf("\n");
+  	  }
+    
+	  printf("\nmatrix_D\n");
+	  for( i = 0  ; i < 8 ; i++){
+      for(j = 0; j <8; j++)
+      	printf("%d ",matrix_d_ex[i][j].s32);
+        printf("\n");
+	  }
+  }
+
+  for (thrd = 0; thrd < core->get_warp_size(); thrd++) {
+    int row=thrd/4;
+    int col = 2*(thrd%4);
+    thread = core->get_thread_info()[tid + thrd];
+
+    thread->set_wmma_vector_operand_values(
+    dst, matrix_d_ex[row][col], matrix_d_ex[row][col+1]);
+
   }
 }
 
@@ -3432,6 +3872,7 @@ void mma_st_impl(const ptx_instruction *pI, core_t *core, warp_inst_t &inst) {
   unsigned type = pI->get_type();
   unsigned wmma_type = pI->get_wmma_type();
   unsigned wmma_layout = pI->get_wmma_layout(0);
+  unsigned wmma_config = pI->get_wmma_config();
   int stride;
 
   if (core->get_gpu()->is_functional_sim())
@@ -3500,7 +3941,7 @@ void mma_st_impl(const ptx_instruction *pI, core_t *core, warp_inst_t &inst) {
           printf("thread=%d:", thrd);
           for (l = 0; l < 8; l++) {
             temp = v[l].f32;
-            printf("%.2f", temp);
+            printf("%.2f ", temp);
           }
           printf("\n");
         }
@@ -3518,23 +3959,61 @@ void mma_st_impl(const ptx_instruction *pI, core_t *core, warp_inst_t &inst) {
         }
 
         if (core->get_gpu()->gpgpu_ctx->debug_tensorcore)
-          printf(
-              "wmma:store:thread%d=%llx,%llx,%llx,%llx,%llx,%llx,%llx,%llx\n",
-              thrd, nw_v[0].s64, nw_v[1].s64, nw_v[2].s64, nw_v[3].s64,
-              nw_v[4].s64, nw_v[5].s64, nw_v[6].s64, nw_v[7].s64);
-      }
+            printf(
+                "wmma:store:thread%d=%llx,%llx,%llx,%llx,%llx,%llx,%llx,%llx\n",
+                thrd, nw_v[0].s64, nw_v[1].s64, nw_v[2].s64, nw_v[3].s64,
+                nw_v[4].s64, nw_v[5].s64, nw_v[6].s64, nw_v[7].s64);
+      } else if(wmma_config==M8N8K32 || wmma_config==M8N8K128){
+        push_addr = addr + 4*stride*(thrd/4)+8*(thrd%4);
+        //  printf("thread%d first memory write: %d\n",thrd, v[0].s64);
+        mem->write(push_addr, 4, &v[0].s64, thread, pI);       //size/8 =4
+        mem_txn_addr[num_mem_txn++] = push_addr;
+        push_addr = addr + 4*stride*(thrd/4)+8*(thrd%4)+4;
+        //  printf("thread%d first memory write: %d\n",thrd, v[1].s64);
+        mem->write(push_addr, 4, &v[1].s64, thread, pI);       //size/8 =4
+      } else if(type==S32_TYPE){
+        if (core->get_gpu()->gpgpu_ctx->debug_tensorcore)	
+		      printf("addr : %x ",addr);
+		    if(k/4==0){
+		    	push_addr=addr+4*stride*(thrd/4)+16*(thrd%4)+4*k;
+		    }
+		    else{
+		    	push_addr=addr+8*4*stride+4*stride*(thrd/4)+16*(thrd%4)+4*(k-4);
+		    }
+		    if (core->get_gpu()->gpgpu_ctx->debug_tensorcore)	
+          printf("thread%d %dth memory write: %d\n",thrd, k, v[k].s64);        
+		    mem->write(push_addr, size / 8, &v[k].s64, thread, pI);       //size/8 =4
+        mem_txn_addr[num_mem_txn++] = push_addr;
+
+        if (core->get_gpu()->gpgpu_ctx->debug_tensorcore) {
+          /* printf(
+          "wmma:store:thread%d=%d,%d,%d,%d,%d,%d,%d,%d\n",
+          thrd, v[0].s64, v[1].s64, v[2].s64, v[3].s64, v[4].s64, v[5].s64,
+          v[6].s64, v[7].s64);*/
+          int temp;
+          int l;
+          printf("push addr : %x , thread=%d:",push_addr, thrd);
+          for (l = 0; l < 8; l++) {
+            temp = v[l].s32;
+            printf("%d ", temp);
+          }
+          printf("\n");
+        }
+	    }
+
     }
 
     delete[] v;
     inst.space = space;
     inst.set_addr(thrd, (new_addr_type *)mem_txn_addr, num_mem_txn);
 
-    if ((type == F16_TYPE) &&
-        (wmma_layout == COL))  // check the profiling xls for details
+    if ((type == F16_TYPE) && (wmma_layout == COL))  // check the profiling xls for details
       inst.data_size = 2;      // 2 byte transaction
+    else if(wmma_config ==M8N8K32 || wmma_config==M8N8K128)
+	    inst.data_size=8;
     else
       inst.data_size = 4;  // 4 byte transaction
-
+    
     assert(inst.memory_op == insn_memory_op);
     // thread->m_last_effective_address = addr;
     // thread->m_last_memory_space = space;
@@ -3552,6 +4031,7 @@ void mma_ld_impl(const ptx_instruction *pI, core_t *core, warp_inst_t &inst) {
   unsigned type = pI->get_type();
   unsigned wmma_type = pI->get_wmma_type();
   unsigned wmma_layout = pI->get_wmma_layout(0);
+  unsigned wmma_config = pI->get_wmma_config();
   int tid;
   int thrd, stride;
   ptx_thread_info *thread;
@@ -3595,6 +4075,179 @@ void mma_ld_impl(const ptx_instruction *pI, core_t *core, warp_inst_t &inst) {
     addr_t fetch_addr;
     new_addr_type mem_txn_addr[MAX_ACCESSES_PER_INSN_PER_THREAD];
     int num_mem_txn = 0;
+
+    ////////////////////////////////u4,s4,b1 or experimental////////////////////////////////
+    if(wmma_config==M8N8K32 || wmma_config==M8N8K128){
+        if (wmma_type == LOAD_A) {
+		      if(wmma_config==M8N8K32)
+ 	        	new_addr = addr + stride/2 * (thrd/4) + 4*(thrd%4);
+		      else
+			      new_addr = addr + stride/8 * (thrd/4) + 4*(thrd%4);
+		      fetch_addr = new_addr;	
+		      mem->read(fetch_addr, 4, &data[0].s64);
+		      mem_txn_addr[num_mem_txn++] = fetch_addr;
+        	if (core->get_gpu()->gpgpu_ctx->debug_tensorcore){
+			      printf("------------------------------------------------\n");
+            printf("A thread %u's element : %d at address %u\n", thrd, data[0].s64, fetch_addr);
+		      }       	
+	      }
+      	else if (wmma_type == LOAD_B) {
+		      if(wmma_config==M8N8K32)
+		      	new_addr = addr + stride/2 * (thrd/4) + 4*(thrd%4);
+		      else
+		      	new_addr = addr + stride/8 * (thrd/4) + 4*(thrd%4);
+		      fetch_addr = new_addr;
+          mem->read(fetch_addr, 4, &data[0].s64);
+          mem_txn_addr[num_mem_txn++] = fetch_addr;
+          if (core->get_gpu()->gpgpu_ctx->debug_tensorcore){
+		 	      printf("------------------------------------------------\n");
+            printf("B thread %u's element : %d at address %u\n", thrd, data[0].s64, fetch_addr);
+          }
+        }
+  
+      else if(wmma_type == LOAD_C){
+	      new_addr = addr + stride*4*(thrd/4)+8*(thrd%4);
+	      fetch_addr = new_addr;
+        mem->read(fetch_addr, 4, &data[0].s64);
+        mem_txn_addr[num_mem_txn++] = fetch_addr;
+	      if (core->get_gpu()->gpgpu_ctx->debug_tensorcore){
+	      	printf("------------------------------------------------\n");
+          printf("C thread %u's first  element : %d at address %u\n", thrd, data[0].s64, fetch_addr);
+        }         
+        fetch_addr+=4;
+	      mem->read(fetch_addr, 4, &data[1].s64);
+	      if (core->get_gpu()->gpgpu_ctx->debug_tensorcore){
+	      	printf("------------------------------------------------\n");
+          printf("C thread %u's second element : %d at address %u\n", thrd, data[1].s64, fetch_addr);}
+	      }
+	    goto SMY1; 
+    }
+
+    ////////////////////////////////INT8////////////////////////////////
+    else if (type == U8_TYPE || type == S32_TYPE){
+	    if (wmma_type == LOAD_A) {
+	    	new_addr = addr + 4 * thrd;
+        for (i = 0; i < 4; i++) {
+        	if (wmma_layout == ROW) {
+            fetch_addr = new_addr + i;
+            mem->read(fetch_addr, size / 8, &data[i].s64);
+          } 	
+	    		else {
+            printf("mma_ld:wrong_layout_type\n");
+            abort();
+          }
+	    		if (i % 4 == 0) mem_txn_addr[num_mem_txn++] = fetch_addr;
+	    		if (core->get_gpu()->gpgpu_ctx->debug_tensorcore){
+	    			printf("------------------------------------------------\n");
+	    			printf("A thread %u's element : %d\n", thrd, data[i].s64);
+          }
+        }
+        
+	    	new_addr += 8*stride;
+	    	for(i = 0 ; i < 4 ; i++){
+	    		if(wmma_layout==ROW){
+            fetch_addr = new_addr + i;
+            mem->read(fetch_addr, size / 8, &data[i+4].s64);
+          }       
+	    		else {
+            printf("mma_ld:wrong_layout_type\n");
+            abort();
+          }
+          if (i % 4 == 0) mem_txn_addr[num_mem_txn++] = fetch_addr;
+
+	    		if (core->get_gpu()->gpgpu_ctx->debug_tensorcore){
+	    			printf("------------------------------------------------\n");
+            printf("A thread %u's element : %d\n", thrd, data[i+4].s64);
+          }
+	    	}
+      }
+
+      else if (wmma_type == LOAD_B) {
+	    	wmma_layout == COL ? new_addr = addr+4*thrd : new_addr = addr + stride*(thrd%4)+thrd/4;
+
+	    	for (i = 0; i < 4; i++) {
+          if (wmma_layout == COL) {
+          		fetch_addr = new_addr + i;
+          		mem->read(fetch_addr, size / 8, &data[i].s64);
+          } 
+	    		else {
+	    			fetch_addr = new_addr+i*stride;
+	    			mem->read(fetch_addr, size /8 , &data[i].s64);
+          }
+          if (i % 4 == 0) mem_txn_addr[num_mem_txn++] = fetch_addr;
+
+	    		if (core->get_gpu()->gpgpu_ctx->debug_tensorcore){
+	    			printf("------------------------------------------------\n");
+            printf("B thread %u's element : %d\n", thrd, data[i].s64);
+	    			printf("new addr: %o, fetch_addr: %o\n", new_addr,fetch_addr);
+          }      
+	    	}
+
+	    	wmma_layout == COL ? new_addr+=8*stride : new_addr+=8;
+
+	    	for(i = 0 ; i < 4 ; i++){
+          if(wmma_layout==COL){
+            fetch_addr = new_addr + i;
+            mem->read(fetch_addr, size / 8, &data[i+4].s64);
+          }       
+	    		else {
+	    			fetch_addr = new_addr + i*stride;
+            mem->read(fetch_addr, size / 8, &data[i+4].s64);
+          }
+
+	    		if (i % 4 == 0) mem_txn_addr[num_mem_txn++] = fetch_addr;
+
+	    		if (core->get_gpu()->gpgpu_ctx->debug_tensorcore){
+            printf("------------------------------------------------\n");
+            printf("B thread %u's element : %d\n", thrd, data[i+4].s64);
+            printf("new addr: %o, fetch_addr: %o\n", new_addr,fetch_addr);
+          }
+	    	}
+      }
+
+	    else if (wmma_type == LOAD_C && type ==S32_TYPE) {
+        new_addr = addr + 4*4*thrd; 
+
+	    	for (i = 0; i < 4; i++) {
+          if (wmma_layout == ROW) {
+            fetch_addr = new_addr + 4*i;
+            mem->read(fetch_addr, size / 8, &data[i].s64);
+          }	       
+	    		else {
+            printf("mma_ld:wrong_layout_type\n");
+            abort();
+          }
+          if (i % 4 == 0) mem_txn_addr[num_mem_txn++] = fetch_addr;
+
+	    		if (core->get_gpu()->gpgpu_ctx->debug_tensorcore){
+            printf("------------------------------------------------\n");
+            printf("C thread %u's element : %d\n", thrd, data[i].s64);
+          }
+        }
+
+	    	new_addr += 4*8*stride;
+
+	    	for(i = 0 ; i < 4 ; i++){
+          if(wmma_layout==ROW){
+            fetch_addr = new_addr + 4*i;
+            mem->read(fetch_addr, size / 8, &data[i+4].s64);
+          } 
+	    		else {
+            printf("mma_ld:wrong_layout_type\n");
+            abort();
+          }
+
+	    		if (i % 4 == 0) mem_txn_addr[num_mem_txn++] = fetch_addr;
+
+	    		if (core->get_gpu()->gpgpu_ctx->debug_tensorcore){
+            printf("------------------------------------------------\n");
+            printf("C thread %u's element : %d\n", thrd, data[i+4].s64);
+          }
+	    	}
+	    }
+
+	    goto SMY1;
+    }
 
     if (wmma_type == LOAD_A) {
       for (i = 0; i < 16; i++) {
@@ -3660,6 +4313,8 @@ void mma_ld_impl(const ptx_instruction *pI, core_t *core, warp_inst_t &inst) {
       ;
       abort();
     }
+
+SMY1:
     // generate timing memory request
     inst.space = space;
     inst.set_addr(thrd, (new_addr_type *)mem_txn_addr, num_mem_txn);
@@ -3674,11 +4329,11 @@ void mma_ld_impl(const ptx_instruction *pI, core_t *core, warp_inst_t &inst) {
 
     if (core->get_gpu()->gpgpu_ctx->debug_tensorcore) {
       if (type == F16_TYPE) {
-        printf("\nmma_ld:thread%d= ", thrd);
-        for (i = 0; i < 16; i++) {
-          printf("%llx ", data[i].u64);
-        }
-        printf("\n");
+        // printf("\nmma_ld:thread%d= ", thrd);
+        // for (i = 0; i < 16; i++) {
+        //   printf("%llx ", data[i].u64);
+        // }
+        // printf("\n");
 
         printf("\nmma_ld:thread%d= ", thrd);
         float temp;
@@ -3687,21 +4342,55 @@ void mma_ld_impl(const ptx_instruction *pI, core_t *core, warp_inst_t &inst) {
           printf("%.2f ", temp);
         }
         printf("\n");
-      } else {
+      } 
+      else if(wmma_config == M8N8K32 || wmma_config == M8N8K128){}
+      else {
         printf("\nmma_ld:thread%d= ", thrd);
         for (i = 0; i < 8; i++) {
           printf("%.2f ", data[i].f32);
         }
         printf("\n");
-        printf("\nmma_ld:thread%d= ", thrd);
-        for (i = 0; i < 8; i++) {
-          printf("%llx ", data[i].u64);
-        }
-        printf("\n");
+        // printf("\nmma_ld:thread%d= ", thrd);
+        // for (i = 0; i < 8; i++) {
+        //   printf("%llx ", data[i].u64);
+        // }
+        // printf("\n");
       }
     }
 
-    if ((wmma_type == LOAD_C) && (type == F32_TYPE)) {
+    if((wmma_config == M8N8K32  || wmma_config==M8N8K128)&& wmma_type != LOAD_C){
+      ptx_reg_t nw_data;
+      nw_data.s64 = data[0].s64;
+      thread->set_wmma_vector_operand_values(dst, nw_data);
+    }
+
+    else if((wmma_config == M8N8K32 || wmma_config==M8N8K128) && wmma_type == LOAD_C){
+      ptx_reg_t nw_data[2];
+      int num_reg=2;
+      for(i=0; i<num_reg; i++){
+        nw_data[i].s64 = data[i].s64;
+      }
+      thread->set_wmma_vector_operand_values(dst, nw_data[0], nw_data[1]);
+    }
+
+    else if((type==U8_TYPE) && (wmma_type != LOAD_C)){
+      ptx_reg_t nw_data[2];
+      int num_reg=2;
+      for(i=0; i<num_reg; i++){
+        nw_data[i].s64 = ((data[4*i].s64 & 0xff) <<24) |
+        ((data[4*i+1].s64 & 0xff) <<16) |
+        ((data[4*i+2].s64 & 0xff) <<8) |
+        ((data[4*i+3].s64 & 0xff)) ;
+      }
+      thread->set_wmma_vector_operand_values(dst, nw_data[0], nw_data[1]);
+    }
+
+    else if((type==S32_TYPE) && (wmma_type == LOAD_C)){
+        	thread->set_wmma_vector_operand_values(dst, 
+          data[0], data[1], data[2],data[3], data[4], data[5], data[6],data[7]);
+    }
+
+    else if ((wmma_type == LOAD_C) && (type == F32_TYPE)) {
       thread->set_wmma_vector_operand_values(dst, data[0], data[1], data[2],
                                              data[3], data[4], data[5], data[6],
                                              data[7]);
@@ -3726,37 +4415,37 @@ void mma_ld_impl(const ptx_instruction *pI, core_t *core, warp_inst_t &inst) {
         thread->set_wmma_vector_operand_values(
             dst, nw_data[0], nw_data[1], nw_data[2], nw_data[3], nw_data[4],
             nw_data[5], nw_data[6], nw_data[7]);
-      if (core->get_gpu()->gpgpu_ctx->debug_tensorcore) {
-        printf(
-            "mma_ld:data[0].s64=%llx,data[1].s64=%llx,new_data[0].s64=%llx\n",
-            data[0].u64, data[1].u64, nw_data[0].u64);
-        printf(
-            "mma_ld:data[2].s64=%llx,data[3].s64=%llx,new_data[1].s64=%llx\n",
-            data[2].u64, data[3].u64, nw_data[1].u64);
-        printf(
-            "mma_ld:data[4].s64=%llx,data[5].s64=%llx,new_data[2].s64=%llx\n",
-            data[4].u64, data[5].u64, nw_data[2].u64);
-        printf(
-            "mma_ld:data[6].s64=%llx,data[7].s64=%llx,new_data[3].s64=%llx\n",
-            data[6].u64, data[7].u64, nw_data[3].u64);
-        if (wmma_type != LOAD_C) {
-          printf(
-              "mma_ld:data[8].s64=%llx,data[9].s64=%llx,new_data[4].s64=%llx\n",
-              data[8].u64, data[9].u64, nw_data[4].s64);
-          printf(
-              "mma_ld:data[10].s64=%llx,data[11].s64=%llx,new_data[5].s64=%"
-              "llx\n",
-              data[10].u64, data[11].u64, nw_data[5].u64);
-          printf(
-              "mma_ld:data[12].s64=%llx,data[13].s64=%llx,new_data[6].s64=%"
-              "llx\n",
-              data[12].u64, data[13].u64, nw_data[6].u64);
-          printf(
-              "mma_ld:data[14].s64=%llx,data[15].s64=%llx,new_data[7].s64=%"
-              "llx\n",
-              data[14].u64, data[15].u64, nw_data[3].u64);
-        }
-      }
+      // if (core->get_gpu()->gpgpu_ctx->debug_tensorcore) {
+      //   printf(
+      //       "mma_ld:data[0].s64=%llx,data[1].s64=%llx,new_data[0].s64=%llx\n",
+      //       data[0].u64, data[1].u64, nw_data[0].u64);
+      //   printf(
+      //       "mma_ld:data[2].s64=%llx,data[3].s64=%llx,new_data[1].s64=%llx\n",
+      //       data[2].u64, data[3].u64, nw_data[1].u64);
+      //   printf(
+      //       "mma_ld:data[4].s64=%llx,data[5].s64=%llx,new_data[2].s64=%llx\n",
+      //       data[4].u64, data[5].u64, nw_data[2].u64);
+      //   printf(
+      //       "mma_ld:data[6].s64=%llx,data[7].s64=%llx,new_data[3].s64=%llx\n",
+      //       data[6].u64, data[7].u64, nw_data[3].u64);
+      //   if (wmma_type != LOAD_C) {
+      //     printf(
+      //         "mma_ld:data[8].s64=%llx,data[9].s64=%llx,new_data[4].s64=%llx\n",
+      //         data[8].u64, data[9].u64, nw_data[4].s64);
+      //     printf(
+      //         "mma_ld:data[10].s64=%llx,data[11].s64=%llx,new_data[5].s64=%"
+      //         "llx\n",
+      //         data[10].u64, data[11].u64, nw_data[5].u64);
+      //     printf(
+      //         "mma_ld:data[12].s64=%llx,data[13].s64=%llx,new_data[6].s64=%"
+      //         "llx\n",
+      //         data[12].u64, data[13].u64, nw_data[6].u64);
+      //     printf(
+      //         "mma_ld:data[14].s64=%llx,data[15].s64=%llx,new_data[7].s64=%"
+      //         "llx\n",
+      //         data[14].u64, data[15].u64, nw_data[3].u64);
+      //   }
+      // }
     }
 
     // thread->m_last_effective_address = addr;

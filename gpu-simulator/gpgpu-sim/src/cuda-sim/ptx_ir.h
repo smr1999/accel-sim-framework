@@ -1040,6 +1040,8 @@ class ptx_instruction : public warp_inst_t {
   unsigned get_vector() const { return m_vector_spec; }
   unsigned get_atomic() const { return m_atomic_spec; }
 
+  int get_wmma_config() const {return m_wmma_config;}
+
   int get_wmma_type() const { return m_wmma_type; }
   int get_wmma_layout(int index) const {
     return m_wmma_layout[index];  // 0->Matrix D,1->Matrix C
@@ -1050,6 +1052,11 @@ class ptx_instruction : public warp_inst_t {
   }
 
   int get_type2() const {
+    if(m_scalar_type.size()==4){
+		  std::list<int>::const_iterator iter=m_scalar_type.begin();
+		  return *(++iter);
+	  }
+
     assert(m_scalar_type.size() == 2);
     return m_scalar_type.back();
   }
@@ -1153,6 +1160,7 @@ class ptx_instruction : public warp_inst_t {
                // branches (ie jumps)
   bool m_to_option;
   unsigned m_cache_option;
+  int m_wmma_config; // For s4,u4, b1
   int m_wmma_type;
   int m_wmma_layout[2];
   int m_wmma_configuration;
